@@ -186,7 +186,7 @@ def get_dtype(ea, op_idx):
     """Get the data type and size for a given operand"""
     insn  = idautils.DecodeInstruction(ea)
     dtype = insn[op_idx].dtype
-    return dtype, idaapi.get_dtyp_size(dtype)
+    return dtype, idaapi.get_dtype_size(dtype)
 
 # return a normalized code, or None if input is invalid
 def convert_hexstr(code):
@@ -318,7 +318,7 @@ class Keypatch_Asm:
         idaapi.dt_qword   : 'qword',    #  64 bit
         idaapi.dt_byte16  : 'xmmword',  #  128 bit
         idaapi.dt_byte32  : 'ymmword',  # 256 bit
-		
+        
         #idaapi.dt_tbyte = 5        #  variable size (ph.tbyte_size)
         #idaapi.dt_packreal = 6     #  packed real format for mc68040
         #idaapi.dt_code = 9         #  ptr to code (not used?)
@@ -346,7 +346,7 @@ class Keypatch_Asm:
 
     @staticmethod
     def get_hardware_mode():
-   	    """Detect and return Keystone arch & mode (with endianess included)"""
+        """Detect and return Keystone arch & mode (with endianess included)"""
         arch, mode = None, None
 
         # heuristically detect hardware setup
@@ -427,10 +427,12 @@ class Keypatch_Asm:
     def update_hardware_mode(self):
         (self.arch, self.mode) = self.get_hardware_mode()
 
-    # normalize assembly code
-    # remove comment at the end of assembly code
     @staticmethod
     def asm_normalize(text):
+        """
+        Normalize assembly code
+        - Remove comment at the end of assembly code
+        """
         text = ' '.join(text.split())
         if text.rfind(';') != -1:
             return text[:text.rfind(';')].strip()
@@ -454,7 +456,7 @@ class Keypatch_Asm:
             return 0
 
     @staticmethod
-    def _resolve(_op, ignore_kw=True):
+    def _resolve(address, _op, ignore_kw=True):
         names = re.findall(r"[\$a-z0-9_:\.]+", _op, re.I)
 
         # try to resolve all names
@@ -502,10 +504,10 @@ class Keypatch_Asm:
                 _op[2] = _op[0]
                 _op[0] = ''
             else:
-                _op[0] = self._resolve(_op[0], ignore_kw=True)
+                _op[0] = self._resolve(address, _op[0], ignore_kw=True)
                 ignore_kw = False
 
-            _op[2] = self._resolve(_op[2], ignore_kw=ignore_kw)
+            _op[2] = self._resolve(address, _op[2], ignore_kw=ignore_kw)
 
             opers[idx] = ''.join(_op)
 
@@ -625,7 +627,7 @@ class Keypatch_Asm:
         return asm
 
 
-    def fix_ida_syntax(assembly):
+    def fix_ida_syntax(self, assembly):
         """
         IDA uses different syntax from Keystone
         sometimes, we can convert code to be consumable by Keystone
@@ -759,10 +761,10 @@ class Keypatch_Asm:
 
 
     def assemble(self, assembly, address, arch=None, mode=None, syntax=None, ks=None):
-	    """
-		Assemble code with Keystone
-	    Return (encoding, count), or (None, 0) on failure
-		"""
+        """
+        Assemble code with Keystone
+        Return (encoding, count), or (None, 0) on failure
+        """
         # return assembly with arithmetic equation evaluated
         def eval_operand(assembly, start, stop, prefix=''):
             imm = assembly[start+1:stop]
