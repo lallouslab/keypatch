@@ -54,6 +54,7 @@ from keystone import *
 import idc
 import idaapi
 import six
+import idautils
 
 ################################ IDA 6/7 Compatibility import ###########################################
 if idaapi.IDA_SDK_VERSION >= 700:
@@ -80,6 +81,8 @@ if idaapi.IDA_SDK_VERSION >= 700:
         Choose,
         jumpto
     )
+    _AST_ENABLE_FOR_WIDGET  = idaapi.AST_ENABLE_FOR_WIDGET
+    _AST_DISABLE_FOR_WIDGET = idaapi.AST_DISABLE_FOR_WIDGET
 else:
     from idc import (
         GetOpType as get_operand_type,
@@ -103,6 +106,9 @@ else:
         func_setend as set_func_end,
         Choose2 as Choose
     )
+    _AST_ENABLE_FOR_WIDGET  = idaapi.AST_ENABLE_FOR_FORM
+    _AST_DISABLE_FOR_WIDGET = idaapi.AST_DISABLE_FOR_FORM    
+
 #########################################################################################################
 
 # bleeding-edge version
@@ -141,19 +147,12 @@ def to_hexstr(buf, sep=' '):
     if six.PY3 and isinstance(buf, bytes):
         return sep.join("{0:02x}".format(c) for c in buf).upper()
     return sep.join("{0:02x}".format(ord(c)) for c in buf).upper()
-#########################################################################################################
 
 ################################ IDA 6/7 Compatibility function #########################################
-def get_dtype(ea, op_idx):
+def find_binary(self, ea, value):
     if idaapi.IDA_SDK_VERSION >= 700:
-        insn = idaapi.insn_t()
-        idaapi.decode_insn(insn, ea)
-        dtype = insn.ops[op_idx].dtype
-        dtyp_size = idaapi.get_dtype_size(dtype)
-    else:
-        dtype = idaapi.cmd.Operands[op_idx].dtyp
-        dtyp_size = idaapi.get_dtyp_size(dtype)
-    return dtype, dtyp_size
+        return ida_search.find_binary(ea, idaapi.cvar.inf.max_ea, value, 16, idc.SEARCH_DOWN)
+    return idc.FindBinary(ea, idc.SEARCH_DOWN, value)
 
 def set_comment(ea, comment):
     if idaapi.IDA_SDK_VERSION >= 700:
@@ -161,16 +160,33 @@ def set_comment(ea, comment):
     else:
         idc.MakeComm(ea, comment)
 
+
 def get_comment(ea):
     if idaapi.IDA_SDK_VERSION >= 700:
         return idc.get_cmt(ea, 0)
     return idc.Comment(ea)
 
+
 def read_range_selection():
     if idaapi.IDA_SDK_VERSION >= 700:
         return idaapi.read_range_selection(None)
     return idaapi.read_selection()
+
 #########################################################################################################
+
+def read_bytesx(ea, size):
+    """Conditionally read bytes from the database or the debubber (if it was active)"""
+    if idaapi.is_debugger_on():
+        return idaapi.dbg_read_memory(ea, size)
+    else:
+        return idaapi.get_bytes(ea, size)
+
+
+def get_dtype(ea, op_idx):
+    """Get the data type and size for a given operand"""
+    insn  = idautils.DecodeInstruction(ea)
+    dtype = insn[op_idx].dtype
+    return dtype, idaapi.get_dtyp_size(dtype)
 
 # return a normalized code, or None if input is invalid
 def convert_hexstr(code):
@@ -261,6 +277,7 @@ def get_name_value(_from, name):
     return (typ, value)
 
 
+#########################################################################################################
 ## Main Keypatch class
 class Keypatch_Asm:
     # supported architectures
@@ -288,8 +305,30 @@ class Keypatch_Asm:
 
     syntax_lists = {
         "Intel": KS_OPT_SYNTAX_INTEL,
-        "Nasm": KS_OPT_SYNTAX_NASM,
-        "AT&T": KS_OPT_SYNTAX_ATT
+        "Nasm" : KS_OPT_SYNTAX_NASM,
+        "AT&T" : KS_OPT_SYNTAX_ATT
+    }
+
+    _dtyp_lists = {
+        idaapi.dt_byte    : 'byte',     #  8 bit
+        idaapi.dt_word    : 'word',     #  16 bit
+        idaapi.dt_dword   : 'dword',    #  32 bit
+        idaapi.dt_float   : 'dword',    #  4 byte
+        idaapi.dt_double  : 'dword',    #  8 byte
+        idaapi.dt_qword   : 'qword',    #  64 bit
+        idaapi.dt_byte16  : 'xmmword',  #  128 bit
+        idaapi.dt_byte32  : 'ymmword',  # 256 bit
+		
+        #idaapi.dt_tbyte = 5        #  variable size (ph.tbyte_size)
+        #idaapi.dt_packreal = 6     #  packed real format for mc68040
+        #idaapi.dt_code = 9         #  ptr to code (not used?)
+        #idaapi.dt_void = 10        #  none
+        #idaapi.dt_fword = 11       #  48 bit
+        #idaapi.dt_bitfild = 12     #  bit field (mc680x0)
+        #idaapi.dt_string = 13      #  pointer to asciiz string
+        #idaapi.dt_unicode = 14     #  pointer to unicode string
+        #idaapi.dt_3byte = 15       #  3-byte data
+        #idaapi.dt_ldbl = 16        #  long double (which may be different from tbyte)
     }
 
     def __init__(self, arch=None, mode=None):
@@ -305,10 +344,10 @@ class Keypatch_Asm:
         # IDA uses Intel syntax by default
         self.syntax = KS_OPT_SYNTAX_INTEL
 
-    # return Keystone arch & mode (with endianess included)
     @staticmethod
     def get_hardware_mode():
-        (arch, mode) = (None, None)
+   	    """Detect and return Keystone arch & mode (with endianess included)"""
+        arch, mode = None, None
 
         # heuristically detect hardware setup
         info = idaapi.get_inf_structure()
@@ -384,6 +423,7 @@ class Keypatch_Asm:
 
         return (arch, mode)
 
+
     def update_hardware_mode(self):
         (self.arch, self.mode) = self.get_hardware_mode()
 
@@ -397,12 +437,12 @@ class Keypatch_Asm:
 
         return text.strip()
 
-    @staticmethod
     # check if input address is valid
     # return
     #       -1  invalid address at target binary
     #        0  type mismatch of input address
     #        1  valid address at target binary
+    @staticmethod
     def check_address(address):
         try:
             if is_mapped(address):
@@ -413,35 +453,36 @@ class Keypatch_Asm:
             # invalid type
             return 0
 
+    @staticmethod
+    def _resolve(_op, ignore_kw=True):
+        names = re.findall(r"[\$a-z0-9_:\.]+", _op, re.I)
+
+        # try to resolve all names
+        for name in names:
+            # ignore known keywords
+            if ignore_kw and name in ('byte', 'near', 'short', 'word', 'dword', 'ptr', 'offset'):
+                continue
+
+            sym = name
+
+            # split segment reg
+            parts = name.partition(':')
+            if parts[2] != '':
+                sym = parts[2]
+
+            (typ, value) = get_name_value(address, sym)
+
+            # skip if name doesn't exist or segment / segment registers
+            if typ in (idaapi.NT_SEG, idaapi.NT_NONE):
+                continue
+
+            _op = _op.replace(sym, '0x{0:X}'.format(value))
+
+        return _op
+
     ### resolve IDA names from input asm code
     # todo: a better syntax parser for all archs
     def ida_resolve(self, assembly, address=idc.BADADDR):
-        def _resolve(_op, ignore_kw=True):
-            names = re.findall(r"[\$a-z0-9_:\.]+", _op, re.I)
-
-            # try to resolve all names
-            for name in names:
-                # ignore known keywords
-                if ignore_kw and name in ('byte', 'near', 'short', 'word', 'dword', 'ptr', 'offset'):
-                    continue
-
-                sym = name
-
-                # split segment reg
-                parts = name.partition(':')
-                if parts[2] != '':
-                    sym = parts[2]
-
-                (typ, value) = get_name_value(address, sym)
-
-                # skip if name doesn't exist or segment / segment registers
-                if typ in (idaapi.NT_SEG, idaapi.NT_NONE):
-                    continue
-
-                _op = _op.replace(sym, '0x{0:X}'.format(value))
-
-            return _op
-
         if self.check_address(address) == 0:
             print("Keypatch: WARNING: invalid input address {0}".format(address))
             return assembly
@@ -450,8 +491,8 @@ class Keypatch_Asm:
         if not (self.arch in (KS_ARCH_X86, KS_ARCH_ARM, KS_ARCH_ARM64, KS_ARCH_MIPS, KS_ARCH_PPC, KS_ARCH_SPARC)):
             return assembly
 
-        _asm = assembly.partition(' ')
-        mnem = _asm[0]
+        _asm  = assembly.partition(' ')
+        mnem  = _asm[0]
         opers = _asm[2].split(',')
 
         for idx, op in enumerate(opers):
@@ -461,10 +502,10 @@ class Keypatch_Asm:
                 _op[2] = _op[0]
                 _op[0] = ''
             else:
-                _op[0] = _resolve(_op[0], ignore_kw=True)
+                _op[0] = self._resolve(_op[0], ignore_kw=True)
                 ignore_kw = False
 
-            _op[2] = _resolve(_op[2], ignore_kw=ignore_kw)
+            _op[2] = self._resolve(_op[2], ignore_kw=ignore_kw)
 
             opers[idx] = ''.join(_op)
 
@@ -474,53 +515,37 @@ class Keypatch_Asm:
     # return bytes of instruction or data
     # return None on failure
     def ida_get_item(self, address, hex_output=False):
-        if self.check_address(address) != 1:
-            # not a valid address
-            return (None, 0)
+        while True:
+            if self.check_address(address) != 1:
+                # not a valid address
+                break
 
-        # return None if address is in the middle of instruction / data
-        if address != get_item_head(address):
-            return (None, 0)
+            # Fail if address is in the middle of instruction / data
+            if address != get_item_head(address):
+                break
 
-        size = get_item_size(address)
-        item = get_bytes(address, size)
+            size = get_item_size(address)
+            item = read_bytesx(address, size)
 
-        if item is None:
-            return (None, 0)
+            if item is None:
+                break
 
-        if hex_output:
-            item = to_hexstr(item)
+            if hex_output:
+                item = to_hexstr(item)
 
-        return (item, size)
+            return (item, size)
+
+        # Failed
+        return (None, 0)            
+
 
     @staticmethod
     def get_op_dtype_name(ea, op_idx):
-        dtyp_lists = {
-            idaapi.dt_byte: 'byte',     #  8 bit
-            idaapi.dt_word: 'word',     #  16 bit
-            idaapi.dt_dword: 'dword',   #  32 bit
-            idaapi.dt_float: 'dword',   #  4 byte
-            idaapi.dt_double: 'dword',  #  8 byte
-            #idaapi.dt_tbyte = 5        #  variable size (ph.tbyte_size)
-            #idaapi.dt_packreal = 6         #  packed real format for mc68040
-            idaapi.dt_qword: 'qword',   #  64 bit
-            idaapi.dt_byte16: 'xmmword',#  128 bit
-            #idaapi.dt_code = 9         #  ptr to code (not used?)
-            #idaapi.dt_void = 10        #  none
-            #idaapi.dt_fword = 11       #  48 bit
-            #idaapi.dt_bitfild = 12     #  bit field (mc680x0)
-            #idaapi.dt_string = 13      #  pointer to asciiz string
-            #idaapi.dt_unicode = 14     #  pointer to unicode string
-            #idaapi.dt_3byte = 15       #  3-byte data
-            #idaapi.dt_ldbl = 16        #  long double (which may be different from tbyte)
-            idaapi.dt_byte32: 'ymmword',# 256 bit
-        }
-
         dtype, dtyp_size = get_dtype(ea, op_idx)
         if dtype == idaapi.dt_tbyte and dtyp_size == 10:
           return 'xword'
 
-        dtyp_name = dtyp_lists.get(dtype, None)
+        dtyp_name = Keypatch_Asm._dtyp_lists.get(dtype, None)
 
         return dtyp_name
 
@@ -535,6 +560,7 @@ class Keypatch_Asm:
             start = start + get_item_size(start)
 
         return codes
+
 
     # get disasm from IDA
     # return '' on invalid address
@@ -598,10 +624,145 @@ class Keypatch_Asm:
         asm = asm.strip(',')
         return asm
 
-    # assemble code with Keystone
-    # return (encoding, count), or (None, 0) on failure
-    def assemble(self, assembly, address, arch=None, mode=None, syntax=None):
 
+    def fix_ida_syntax(assembly):
+        """
+        IDA uses different syntax from Keystone
+        sometimes, we can convert code to be consumable by Keystone
+        """
+
+        # return True if this insn needs to be fixed
+        def check_arm_arm64_insn(arch, mnem):
+            if arch == KS_ARCH_ARM:
+                if mnem.startswith("ldr") or mnem.startswith("str"):
+                    return True
+                return False
+            elif arch == KS_ARCH_ARM64:
+                if mnem.startswith("ldr") or mnem.startswith("str"):
+                    return True
+                return mnem in ("stp")
+            return False
+
+        # return True if this insn needs to be fixed
+        def check_ppc_insn(mnem):
+            return mnem in ("stw")
+
+        # replace the right most string occurred
+        def rreplace(s, old, new):
+            li = s.rsplit(old, 1)
+            return new.join(li)
+
+        # convert some ARM pre-UAL assembly to UAL, so Keystone can handle it
+        # example: streqb --> strbeq
+        def fix_arm_ual(mnem, assembly):
+            # TODO: this is not an exhaustive list yet
+            if len(mnem) != 6:
+                return assembly
+
+            if (mnem[-1] in ('s', 'b', 'h', 'd')):
+                #print(">> 222", mnem[3:5])
+                if mnem[3:5] in ("cc", "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"):
+                    return assembly.replace(mnem, mnem[:3] + mnem[-1] + mnem[3:5], 1)
+
+            return assembly
+
+        if self.arch != KS_ARCH_X86:
+            assembly = assembly.lower()
+        else:
+            # Keystone does not support immediate 0bh, but only 0Bh
+            assembly = assembly.upper()
+
+        # however, 0X must be converted to 0x
+        # Keystone should fix this limitation in the future
+        assembly = assembly.replace("0X", " 0x")
+
+        _asm = assembly.partition(' ')
+        mnem = _asm[0]
+        if mnem == '':
+            return assembly
+
+        # for PPC, Keystone does not accept registers with 'r' prefix,
+        # but only the number behind. lets try to fix that here by
+        # removing the prefix 'r'.
+        if self.arch == KS_ARCH_PPC:
+            for n in range(32):
+                r = " r%u," %n
+                if r in assembly:
+                    assembly = assembly.replace(r, " %u," %n)
+            for n in range(32):
+                r = "(r%u)" %n
+                if r in assembly:
+                    assembly = assembly.replace(r, "(%u)" %n)
+            for n in range(32):
+                r = ", r%u" %n
+                if assembly.endswith(r):
+                    assembly = rreplace(assembly, r, ", %u" %n)
+
+        if self.arch == KS_ARCH_X86:
+            if mnem == "RETN":
+                # replace retn with ret
+                return assembly.replace('RETN', 'RET', 1)
+            if 'OFFSET ' in assembly:
+                return assembly.replace('OFFSET ', ' ')
+            if mnem in ('CALL', 'JMP') or mnem.startswith('LOOP'):
+                # remove 'NEAR PTR'
+                if ' NEAR PTR ' in assembly:
+                    return assembly.replace(' NEAR PTR ', ' ')
+            elif mnem[0] == 'J':
+                # JMP instruction
+                if ' SHORT ' in assembly:
+                    # remove ' short '
+                    return assembly.replace(' SHORT ', ' ')
+        elif self.arch in (KS_ARCH_ARM, KS_ARCH_ARM64, KS_ARCH_PPC):
+            # *** ARM
+            # LDR     R1, [SP+rtld_fini],#4
+            # STR     R2, [SP,#-4+rtld_fini]!
+            # STR     R0, [SP,#fini]!
+            # STR     R12, [SP,#4+var_8]!
+
+            # *** ARM64
+            # STP     X29, X30, [SP,#-0x10+var_150]!
+            # STR     W0, [X29,#0x150+var_8]
+            # LDR     X0, [X0,#(qword_4D6678 - 0x4D6660)]
+            # TODO:
+            # ADRP    X19, #interactive@PAGE
+
+            # *** PPC
+            # stw     r5, 0x120+var_108(r1)
+            
+            if self.arch == KS_ARCH_ARM and mode == KS_MODE_THUMB:
+                assembly = assembly.replace('movt.w', 'movt')
+
+            if self.arch == KS_ARCH_ARM:
+                #print(">> before UAL fix: ", assembly)
+                assembly = fix_arm_ual(mnem, assembly)
+                #print(">> after UAL fix: ", assembly)
+
+            if check_arm_arm64_insn(self.arch, mnem) or (("[" in assembly) and ("]" in assembly)):
+                bang = assembly.find('#')
+                bracket = assembly.find(']')
+                if bang != -1 and bracket != -1 and bang < bracket:
+                    return eval_operand(assembly, bang, bracket, '#')
+                elif '+0x0]' in assembly:
+                    return assembly.replace('+0x0]', ']')
+            elif check_ppc_insn(mnem):
+                start = assembly.find(', ')
+                stop = assembly.find('(')
+                if start != -1 and stop != -1 and start < stop:
+                    return eval_operand(assembly, start, stop)
+        return assembly
+
+
+    @staticmethod
+    def is_thumb(address):
+        return get_sreg(address, 'T') == 1
+
+
+    def assemble(self, assembly, address, arch=None, mode=None, syntax=None, ks=None):
+	    """
+		Assemble code with Keystone
+	    Return (encoding, count), or (None, 0) on failure
+		"""
         # return assembly with arithmetic equation evaluated
         def eval_operand(assembly, start, stop, prefix=''):
             imm = assembly[start+1:stop]
@@ -615,135 +776,7 @@ class Keypatch_Asm:
             except:
                 return assembly
 
-        # IDA uses different syntax from Keystone
-        # sometimes, we can convert code to be consumable by Keystone
-        def fix_ida_syntax(assembly):
-
-            # return True if this insn needs to be fixed
-            def check_arm_arm64_insn(arch, mnem):
-                if arch == KS_ARCH_ARM:
-                    if mnem.startswith("ldr") or mnem.startswith("str"):
-                        return True
-                    return False
-                elif arch == KS_ARCH_ARM64:
-                    if mnem.startswith("ldr") or mnem.startswith("str"):
-                        return True
-                    return mnem in ("stp")
-                return False
-
-            # return True if this insn needs to be fixed
-            def check_ppc_insn(mnem):
-                return mnem in ("stw")
-
-            # replace the right most string occurred
-            def rreplace(s, old, new):
-                li = s.rsplit(old, 1)
-                return new.join(li)
-
-            # convert some ARM pre-UAL assembly to UAL, so Keystone can handle it
-            # example: streqb --> strbeq
-            def fix_arm_ual(mnem, assembly):
-                # TODO: this is not an exhaustive list yet
-                if len(mnem) != 6:
-                    return assembly
-
-                if (mnem[-1] in ('s', 'b', 'h', 'd')):
-                    #print(">> 222", mnem[3:5])
-                    if mnem[3:5] in ("cc", "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"):
-                        return assembly.replace(mnem, mnem[:3] + mnem[-1] + mnem[3:5], 1)
-
-                return assembly
-
-            if self.arch != KS_ARCH_X86:
-                assembly = assembly.lower()
-            else:
-                # Keystone does not support immediate 0bh, but only 0Bh
-                assembly = assembly.upper()
-
-            # however, 0X must be converted to 0x
-            # Keystone should fix this limitation in the future
-            assembly = assembly.replace("0X", " 0x")
-
-            _asm = assembly.partition(' ')
-            mnem = _asm[0]
-            if mnem == '':
-                return assembly
-
-            # for PPC, Keystone does not accept registers with 'r' prefix,
-            # but only the number behind. lets try to fix that here by
-            # removing the prefix 'r'.
-            if self.arch == KS_ARCH_PPC:
-                for n in range(32):
-                    r = " r%u," %n
-                    if r in assembly:
-                        assembly = assembly.replace(r, " %u," %n)
-                for n in range(32):
-                    r = "(r%u)" %n
-                    if r in assembly:
-                        assembly = assembly.replace(r, "(%u)" %n)
-                for n in range(32):
-                    r = ", r%u" %n
-                    if assembly.endswith(r):
-                        assembly = rreplace(assembly, r, ", %u" %n)
-
-            if self.arch == KS_ARCH_X86:
-                if mnem == "RETN":
-                    # replace retn with ret
-                    return assembly.replace('RETN', 'RET', 1)
-                if 'OFFSET ' in assembly:
-                    return assembly.replace('OFFSET ', ' ')
-                if mnem in ('CALL', 'JMP') or mnem.startswith('LOOP'):
-                    # remove 'NEAR PTR'
-                    if ' NEAR PTR ' in assembly:
-                        return assembly.replace(' NEAR PTR ', ' ')
-                elif mnem[0] == 'J':
-                    # JMP instruction
-                    if ' SHORT ' in assembly:
-                        # remove ' short '
-                        return assembly.replace(' SHORT ', ' ')
-            elif self.arch in (KS_ARCH_ARM, KS_ARCH_ARM64, KS_ARCH_PPC):
-                # *** ARM
-                # LDR     R1, [SP+rtld_fini],#4
-                # STR     R2, [SP,#-4+rtld_fini]!
-                # STR     R0, [SP,#fini]!
-                # STR     R12, [SP,#4+var_8]!
-
-                # *** ARM64
-                # STP     X29, X30, [SP,#-0x10+var_150]!
-                # STR     W0, [X29,#0x150+var_8]
-                # LDR     X0, [X0,#(qword_4D6678 - 0x4D6660)]
-                # TODO:
-                # ADRP    X19, #interactive@PAGE
-
-                # *** PPC
-                # stw     r5, 0x120+var_108(r1)
-                
-                if self.arch == KS_ARCH_ARM and mode == KS_MODE_THUMB:
-                    assembly = assembly.replace('movt.w', 'movt')
-
-                if self.arch == KS_ARCH_ARM:
-                    #print(">> before UAL fix: ", assembly)
-                    assembly = fix_arm_ual(mnem, assembly)
-                    #print(">> after UAL fix: ", assembly)
-
-                if check_arm_arm64_insn(self.arch, mnem) or (("[" in assembly) and ("]" in assembly)):
-                    bang = assembly.find('#')
-                    bracket = assembly.find(']')
-                    if bang != -1 and bracket != -1 and bang < bracket:
-                        return eval_operand(assembly, bang, bracket, '#')
-                    elif '+0x0]' in assembly:
-                        return assembly.replace('+0x0]', ']')
-                elif check_ppc_insn(mnem):
-                    start = assembly.find(', ')
-                    stop = assembly.find('(')
-                    if start != -1 and stop != -1 and start < stop:
-                        return eval_operand(assembly, start, stop)
-            return assembly
-
-        def is_thumb(address):
-            return get_sreg(address, 'T') == 1
-
-        if self.check_address(address) == 0:
+        if Keypatch_Asm.check_address(address) == 0:
             return (None, 0)
 
         # use default syntax, arch and mode if not provided
@@ -754,19 +787,22 @@ class Keypatch_Asm:
         if mode is None:
             mode = self.mode
 
-        if arch == KS_ARCH_ARM and is_thumb(address):
+        if arch == KS_ARCH_ARM and Keypatch_Asm.is_thumb(address):
             mode = KS_MODE_THUMB
 
         try:
-            ks = Ks(arch, mode)
-            if arch == KS_ARCH_X86:
-                ks.syntax = syntax
-            encoding, count = ks.asm(fix_ida_syntax(assembly), address)
+            # If no Keystone instance is passed, create a new one
+            if not ks:
+                ks = Ks(arch, mode)
+                if arch == KS_ARCH_X86:
+                    ks.syntax = syntax
+
+            encoding, count = ks.asm(self.fix_ida_syntax(assembly), address)
         except KsError as e:
             # keep the below code for debugging
             #print("Keypatch Error: {0}".format(e))
             #print("Original asm: {0}".format(assembly))
-            #print("Fixed up asm: {0}".format(fix_ida_syntax(assembly)))
+            #print("Fixed up asm: {0}".format(self.fix_ida_syntax(assembly)))
             encoding, count = None, 0
 
         return (encoding, count)
@@ -780,7 +816,6 @@ class Keypatch_Asm:
         orig_data = ''
 
         while ea < (address + size):
-
             if not has_value(get_full_flags(ea)):
                 print("Keypatch: FAILED to read data at 0x{0:X}".format(ea))
                 break
@@ -1003,7 +1038,7 @@ class Keypatch_Asm:
         return (keys, values)
 
     def get_value_by_idx(self, dictionary, idx, default=None):
-        (keys, values) = self.dict_to_ordered_list(dictionary)
+        (keys, values) = Keypatch_Asm.dict_to_ordered_list(dictionary)
 
         try:
             val = values[idx]
@@ -1013,7 +1048,7 @@ class Keypatch_Asm:
         return val
 
     def find_idx_by_value(self, dictionary, value, default=None):
-        (keys, values) = self.dict_to_ordered_list(dictionary)
+        (keys, values) = Keypatch_Asm.dict_to_ordered_list(dictionary)
 
         try:
             idx = values.index(value)
@@ -1036,6 +1071,7 @@ class Keypatch_Asm:
     ### /Form helper functions
 
 
+#########################################################################################################
 # Common ancestor form to be derived by Patcher, FillRange & Search
 class Keypatch_Form(idaapi.Form):
     # prepare for form initializing
@@ -1184,6 +1220,7 @@ class Keypatch_Form(idaapi.Form):
         return opts
 
 
+#########################################################################################################
 # Fill Range form
 class Keypatch_FillRange(Keypatch_Form):
     def __init__(self, kp_asm, addr_begin, addr_end, assembly=None, opts=None):
@@ -1239,6 +1276,7 @@ KEYPATCH:: Fill Range
         return self.update_patchform(fid)
 
 
+#########################################################################################################
 # Patcher form
 class Keypatch_Patcher(Keypatch_Form):
     def __init__(self, kp_asm, address, assembly=None, opts=None):
@@ -1296,6 +1334,7 @@ KEYPATCH:: Patcher
         return self.update_patchform(fid)
 
 
+#########################################################################################################
 # Search position chooser
 class SearchResultChooser(Choose):
     def __init__(self, title, items, flags=0, width=None, height=None, embedded=False, modal=False):
@@ -1331,6 +1370,7 @@ class SearchResultChooser(Choose):
         return self.Show(self.modal) >= 0
 
 
+#########################################################################################################
 # Search form
 class Keypatch_Search(Keypatch_Form):
     def __init__(self, kp_asm, address, assembly=None):
@@ -1375,11 +1415,6 @@ KEYPATCH:: Search
 
         self.Compile()
 
-    ################################ IDA 6/7 Compatibility method #######################################
-    def find_binary(self, ea):
-        if idaapi.IDA_SDK_VERSION >= 700:
-            return ida_search.find_binary(ea, idaapi.cvar.inf.max_ea, self.GetControlValue(self.c_encoding), 16, idc.SEARCH_DOWN)
-        return idc.FindBinary(ea, idc.SEARCH_DOWN, self.GetControlValue(self.c_encoding))
     #####################################################################################################
 
     # callback to be executed when any form control changed
@@ -1389,7 +1424,7 @@ KEYPATCH:: Search
             address = 0
             addresses = []
             while address != idc.BADADDR:
-                address = self.find_binary(address)
+                address = find_binary(address, self.GetControlValue(self.c_encoding))
                 if address == idc.BADADDR:
                     break
                 addresses.append([address])
@@ -1444,6 +1479,7 @@ KEYPATCH:: Search
         return 1
 
 
+#########################################################################################################
 # About form
 class About_Form(idaapi.Form):
     def __init__(self, version):
@@ -1501,11 +1537,10 @@ KEYPATCH:: Check for update
 
         return 1
 
-
+#########################################################################################################
 try:
     # adapted from pull request #7 by @quangnh89
     class Kp_Menu_Context(idaapi.action_handler_t):
-
         @classmethod
         def get_name(self):
             return self.__name__
@@ -1541,11 +1576,11 @@ try:
         def update(self, ctx):
             try:
                 if ctx.form_type == idaapi.BWN_DISASM:
-                    return idaapi.AST_ENABLE_FOR_FORM
+                    return _AST_ENABLE_FOR_WIDGET
                 else:
-                    return idaapi.AST_DISABLE_FOR_FORM
+                    return _AST_DISABLE_FOR_WIDGET
             except Exception as e:
-                # Add exception for main menu on >= IDA 7.0
+                # This should not happen...
                 return idaapi.AST_ENABLE_ALWAYS
             
     # context menu for Patcher
@@ -1587,6 +1622,7 @@ try:
 except:
     pass
 
+#########################################################################################################
 # hooks for popup menu
 class Hooks(idaapi.UI_Hooks):
     if idaapi.IDA_SDK_VERSION >= 700:
@@ -1631,9 +1667,8 @@ class Hooks(idaapi.UI_Hooks):
 # check if we already initialized Keypatch
 kp_initialized = False
 
-#--------------------------------------------------------------------------
+#########################################################################################################
 # Plugin
-#--------------------------------------------------------------------------
 class Keypatch_Plugin_t(idaapi.plugin_t):
     comment = "Keypatch plugin for IDA Pro (using Keystone framework)"
     help = "Find more information on Keypatch at http://keystone-engine.org/keypatch"
@@ -1669,7 +1704,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
         # register popup menu handlers
         try:
-            Kp_MC_Patcher.register(self, "Patcher    (Ctrl-Alt-K)")
+            Kp_MC_Patcher.register(self, "Patcher    %s" % self.wanted_hotkey)
             Kp_MC_Fill_Range.register(self, "Fill Range")
             Kp_MC_Undo.register(self, "Undo last patching")
             Kp_MC_Search.register(self, "Search")
@@ -1683,7 +1718,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
         self.hooks.hook()
 
         self.opts = None
-        if kp_initialized == False:
+        if not kp_initialized:
             kp_initialized = True
 
             if idaapi.IDA_SDK_VERSION >= 700:
@@ -1696,7 +1731,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
                 idaapi.attach_action_to_menu("Edit/Keypatch/Fill Range", Kp_MC_Fill_Range.get_name(), idaapi.SETMENU_APP)
             else:
                 # add Keypatch menu
-                menu = idaapi.add_menu_item("Edit/Keypatch/", "Patcher     (Ctrl-Alt-K)", "", 1, self.patcher, None)
+                menu = idaapi.add_menu_item("Edit/Keypatch/", "Patcher     " % self.wanted_hotkey, "", 1, self.patcher, None)
                 if menu is not None:
                     idaapi.add_menu_item("Edit/Keypatch/", "About", "", 1, self.about, None)
                     idaapi.add_menu_item("Edit/Keypatch/", "Check for update", "", 1, self.updater, None)
@@ -1715,13 +1750,13 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
                     idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Search", "", 0, self.search, None)
                     idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Undo last patching", "", 0, self.undo, None)
                     idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Fill Range", "", 0, self.fill_range, None)
-                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Patcher     (Ctrl-Alt-K)", "", 0, self.patcher, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Patcher     %s" % self.wanted_hotkey, "", 0, self.patcher, None)
 
             print("=" * 80)
             print("Keypatch v{0} (c) Nguyen Anh Quynh & Thanh Nguyen, 2018".format(VERSION))
             print("Keypatch is using Keystone v{0}".format(keystone.__version__))
-            print("Keypatch Patcher's shortcut key is Ctrl-Alt-K")
-            print("Use the same hotkey Ctrl-Alt-K to open 'Fill Range' window on a selected range of code")
+            print("Keypatch Patcher's shortcut key is %s" % self.wanted_hotkey)
+            print("Use the same hotkey %s to open 'Fill Range' window on a selected range of code" % self.wanted_hotkey)
             print("To revert (undo) the last patching, choose menu Edit | Keypatch | Undo last patching")
             print("Keypatch Search is available from menu Edit | Keypatch | Search")
             print("Find more information about Keypatch at http://keystone-engine.org/keypatch")
@@ -1733,6 +1768,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
         return idaapi.PLUGIN_KEEP
 
+
     def term(self):
         if self.hooks is not None:
             self.hooks.unhook()
@@ -1740,7 +1776,8 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
         if self.opts is None:
             return
-        #save configuration to file
+
+        # Save the configuration to file
         try:
             json.dump(self.opts, open(KP_CFGFILE, "wt"))
         except Exception as e:
@@ -1784,6 +1821,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
             warning("ERROR: Keypatch failed to connect to internet (Github). Try again later.")
             print("Keypatch: FAILED to connect to Github to check for latest update. Try again later.")
 
+
     # handler for Undo menu
     def undo(self):
         global patch_info
@@ -1797,6 +1835,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
             self.kp_asm.patch_code(address, None, None, None, None, orig_asm=[assembly], patch_data=p_orig_data, patch_comment=patch_comment, undo=True)
             del(patch_info[-1])
 
+
     # handler for Search menu
     def search(self):
         address = get_screen_ea()
@@ -1804,6 +1843,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
         f.Execute()
         f.Free()
 
+    
     # handler for Patcher menu
     def patcher(self):
         # be sure that this arch is supported by Keystone
@@ -1914,6 +1954,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
         self.patcher()
 
 
+#########################################################################################################
 # register IDA plugin
 def PLUGIN_ENTRY():
     return Keypatch_Plugin_t()
