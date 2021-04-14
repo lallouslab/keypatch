@@ -113,7 +113,7 @@ else:
 
 # bleeding-edge version
 # on a new release, this should be sync with VERSION_STABLE file
-VERSION = "2.2"
+VERSION = "2.3"
 
 
 MAX_INSTRUCTION_STRLEN = 256
@@ -172,6 +172,7 @@ def read_range_selection():
         return idaapi.read_range_selection(None)
     return idaapi.read_selection()
 
+
 #########################################################################################################
 
 def read_bytesx(ea, size):
@@ -188,9 +189,8 @@ def get_dtype(ea, op_idx):
     dtype = insn[op_idx].dtype
     return dtype, idaapi.get_dtype_size(dtype)
 
-# return a normalized code, or None if input is invalid
 def convert_hexstr(code):
-    # normalize code
+    """Return a normalized code, or None if input is invalid"""
     code = code.lower()
     code = code.replace(' ', '')    # remove space
     code = code.replace('h', '')    # remove trailing 'h' in 90h
@@ -331,11 +331,26 @@ class Keypatch_Asm:
         #idaapi.dt_ldbl = 16        #  long double (which may be different from tbyte)
     }
 
-    def __init__(self, arch=None, mode=None):
-        # update current arch and mode
+    ignored_kws = set(('byte', 'near', 'short', 'word', 'dword', 'qword', 'ptr', 'offset'))
+
+    supported_name_resolution_archs = set((
+        KS_ARCH_X86, 
+        KS_ARCH_ARM, KS_ARCH_ARM64, 
+        KS_ARCH_MIPS, 
+        KS_ARCH_PPC, 
+        KS_ARCH_SPARC))
+
+    x86_rep_mnemonics = set(('rep', 'repne', 'repe'))
+
+    arm_ual_mnem = set(("cc", "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"))
+
+    ppc_insn_fixing_list = set(("stw"))
+
+    def __init__(self, arch=None, mode=None, ks=None):
+        # Update current arch and mode
         self.update_hardware_mode()
 
-        # override arch & mode if provided
+        # Override arch & mode if provided
         if arch is not None:
             self.arch = arch
         if mode is not None:
@@ -343,6 +358,23 @@ class Keypatch_Asm:
 
         # IDA uses Intel syntax by default
         self.syntax = KS_OPT_SYNTAX_INTEL
+
+        self.ks = ks
+
+    
+    @staticmethod
+    def check_arm_arm64_insn(arch, mnem):
+        """Return True if this insn needs to be fixed"""
+        if arch == KS_ARCH_ARM:
+            if mnem.startswith("ldr") or mnem.startswith("str"):
+                return True
+            return False
+        elif arch == KS_ARCH_ARM64:
+            if mnem.startswith("ldr") or mnem.startswith("str"):
+                return True
+            return mnem in ("stp")
+        return False
+
 
     @staticmethod
     def get_hardware_mode():
@@ -427,6 +459,7 @@ class Keypatch_Asm:
     def update_hardware_mode(self):
         (self.arch, self.mode) = self.get_hardware_mode()
 
+
     @staticmethod
     def asm_normalize(text):
         """
@@ -439,13 +472,14 @@ class Keypatch_Asm:
 
         return text.strip()
 
-    # check if input address is valid
-    # return
-    #       -1  invalid address at target binary
-    #        0  type mismatch of input address
-    #        1  valid address at target binary
     @staticmethod
     def check_address(address):
+        """Check if input address is valid
+          return
+                -1  invalid address at target binary
+                 0  type mismatch of input address
+                 1  valid address at target binary
+        """
         try:
             if is_mapped(address):
                 return 1
@@ -459,10 +493,10 @@ class Keypatch_Asm:
     def _resolve(address, _op, ignore_kw=True):
         names = re.findall(r"[\$a-z0-9_:\.]+", _op, re.I)
 
-        # try to resolve all names
+        # Try to resolve all names
         for name in names:
             # ignore known keywords
-            if ignore_kw and name in ('byte', 'near', 'short', 'word', 'dword', 'ptr', 'offset'):
+            if ignore_kw and name in Keypatch_Asm.ignored_kws:
                 continue
 
             sym = name
@@ -482,15 +516,15 @@ class Keypatch_Asm:
 
         return _op
 
-    ### resolve IDA names from input asm code
-    # todo: a better syntax parser for all archs
     def ida_resolve(self, assembly, address=idc.BADADDR):
+        """Resolve IDA names from input asm code"""
+        # todo: a better syntax parser for all archs
         if self.check_address(address) == 0:
             print("Keypatch: WARNING: invalid input address {0}".format(address))
             return assembly
 
         # for now, we only support IDA name resolve for X86, ARM, ARM64, MIPS, PPC, SPARC
-        if not (self.arch in (KS_ARCH_X86, KS_ARCH_ARM, KS_ARCH_ARM64, KS_ARCH_MIPS, KS_ARCH_PPC, KS_ARCH_SPARC)):
+        if not (self.arch in self.supported_name_resolution_archs):
             return assembly
 
         _asm  = assembly.partition(' ')
@@ -514,9 +548,12 @@ class Keypatch_Asm:
         asm = "{0} {1}".format(mnem, ','.join(opers))
         return asm
 
-    # return bytes of instruction or data
-    # return None on failure
+
     def ida_get_item(self, address, hex_output=False):
+        """
+        Return bytes of instruction or data
+        Return None on failure
+        """
         while True:
             if self.check_address(address) != 1:
                 # not a valid address
@@ -551,8 +588,9 @@ class Keypatch_Asm:
 
         return dtyp_name
 
-    # return asm instructions from start to end
+    
     def ida_get_disasm_range(self, start, end):
+        """Return asm instructions from start to end"""
         codes = []
         while start < end:
             asm = self.asm_normalize(idc.GetDisasm(start))
@@ -564,10 +602,8 @@ class Keypatch_Asm:
         return codes
 
 
-    # get disasm from IDA
-    # return '' on invalid address
     def ida_get_disasm(self, address, fixup=False):
-
+        """Get disasm from IDA"""
         def GetMnem(asm):
             sp = asm.find(' ')
             if sp == -1:
@@ -583,7 +619,7 @@ class Keypatch_Asm:
             return ''
 
         asm = self.asm_normalize(idc.GetDisasm(address))
-        # for now, only support IDA syntax fixup for Intel CPU
+        # For now, only support IDA syntax fixup for Intel CPU
         if not fixup or self.arch != KS_ARCH_X86:
             return asm
 
@@ -591,7 +627,7 @@ class Keypatch_Asm:
         # rebuild disasm code from IDA
         i = 0
         mnem = GetMnem(asm)
-        if mnem == '' or mnem in ('rep', 'repne', 'repe'):
+        if mnem == '' or mnem in self.x86_rep_mnemonics:
             return asm
 
         opers = []
@@ -632,42 +668,6 @@ class Keypatch_Asm:
         IDA uses different syntax from Keystone
         sometimes, we can convert code to be consumable by Keystone
         """
-
-        # return True if this insn needs to be fixed
-        def check_arm_arm64_insn(arch, mnem):
-            if arch == KS_ARCH_ARM:
-                if mnem.startswith("ldr") or mnem.startswith("str"):
-                    return True
-                return False
-            elif arch == KS_ARCH_ARM64:
-                if mnem.startswith("ldr") or mnem.startswith("str"):
-                    return True
-                return mnem in ("stp")
-            return False
-
-        # return True if this insn needs to be fixed
-        def check_ppc_insn(mnem):
-            return mnem in ("stw")
-
-        # replace the right most string occurred
-        def rreplace(s, old, new):
-            li = s.rsplit(old, 1)
-            return new.join(li)
-
-        # convert some ARM pre-UAL assembly to UAL, so Keystone can handle it
-        # example: streqb --> strbeq
-        def fix_arm_ual(mnem, assembly):
-            # TODO: this is not an exhaustive list yet
-            if len(mnem) != 6:
-                return assembly
-
-            if (mnem[-1] in ('s', 'b', 'h', 'd')):
-                #print(">> 222", mnem[3:5])
-                if mnem[3:5] in ("cc", "eq", "ne", "hs", "lo", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al"):
-                    return assembly.replace(mnem, mnem[:3] + mnem[-1] + mnem[3:5], 1)
-
-            return assembly
-
         if self.arch != KS_ARCH_X86:
             assembly = assembly.lower()
         else:
@@ -698,7 +698,7 @@ class Keypatch_Asm:
             for n in range(32):
                 r = ", r%u" %n
                 if assembly.endswith(r):
-                    assembly = rreplace(assembly, r, ", %u" %n)
+                    assembly = self.rreplace(assembly, r, ", %u" %n)
 
         if self.arch == KS_ARCH_X86:
             if mnem == "RETN":
@@ -737,21 +737,21 @@ class Keypatch_Asm:
 
             if self.arch == KS_ARCH_ARM:
                 #print(">> before UAL fix: ", assembly)
-                assembly = fix_arm_ual(mnem, assembly)
+                assembly = self.fix_arm_ual(mnem, assembly)
                 #print(">> after UAL fix: ", assembly)
 
             if check_arm_arm64_insn(self.arch, mnem) or (("[" in assembly) and ("]" in assembly)):
                 bang = assembly.find('#')
                 bracket = assembly.find(']')
                 if bang != -1 and bracket != -1 and bang < bracket:
-                    return eval_operand(assembly, bang, bracket, '#')
+                    return self.eval_operand(assembly, bang, bracket, '#')
                 elif '+0x0]' in assembly:
                     return assembly.replace('+0x0]', ']')
-            elif check_ppc_insn(mnem):
+            elif self.check_ppc_insn(mnem):
                 start = assembly.find(', ')
                 stop = assembly.find('(')
                 if start != -1 and stop != -1 and start < stop:
-                    return eval_operand(assembly, start, stop)
+                    return self.eval_operand(assembly, start, stop)
         return assembly
 
 
@@ -760,28 +760,58 @@ class Keypatch_Asm:
         return get_sreg(address, 'T') == 1
 
 
+    @staticmethod
+    def fix_arm_ual(mnem, assembly):
+        """Convert some ARM pre-UAL assembly to UAL, so Keystone can handle it
+        Example: streqb --> strbeq"""
+        # TODO: this is not an exhaustive list yet
+        if len(mnem) != 6:
+            return assembly
+
+        if (mnem[-1] in ('s', 'b', 'h', 'd')):
+            if mnem[3:5] in Keypatch_Asm.arm_ual_mnem:
+                return assembly.replace(mnem, mnem[:3] + mnem[-1] + mnem[3:5], 1)
+
+        return assembly
+
+
+    @staticmethod
+    def check_ppc_insn(mnem):
+        """Return True if this insn needs to be fixed"""
+        return mnem in Keypatch_Asm.ppc_insn_fixing_list
+
+
+    @staticmethod
+    def eval_operand(assembly, start, stop, prefix=''):
+        """return assembly with arithmetic equation evaluated"""
+        imm = assembly[start+1:stop]
+        try:
+            eval_imm = eval(imm)
+            if eval_imm > 0x80000000:
+                eval_imm = 0xffffffff - eval_imm
+                eval_imm += 1
+                eval_imm = -eval_imm
+            return assembly.replace(prefix + imm, prefix + hex(eval_imm))
+        except:
+            return assembly
+
+
+    @staticmethod
+    def rreplace(s, old, new):
+        """Replace the right most string occurred"""
+        li = s.rsplit(old, 1)
+        return new.join(li)
+    
+
     def assemble(self, assembly, address, arch=None, mode=None, syntax=None, ks=None):
         """
         Assemble code with Keystone
         Return (encoding, count), or (None, 0) on failure
         """
-        # return assembly with arithmetic equation evaluated
-        def eval_operand(assembly, start, stop, prefix=''):
-            imm = assembly[start+1:stop]
-            try:
-                eval_imm = eval(imm)
-                if eval_imm > 0x80000000:
-                    eval_imm = 0xffffffff - eval_imm
-                    eval_imm += 1
-                    eval_imm = -eval_imm
-                return assembly.replace(prefix + imm, prefix + hex(eval_imm))
-            except:
-                return assembly
-
         if Keypatch_Asm.check_address(address) == 0:
             return (None, 0)
 
-        # use default syntax, arch and mode if not provided
+        # Use default syntax, arch and mode if not provided
         if syntax is None:
             syntax = self.syntax
         if arch is None:
@@ -793,11 +823,14 @@ class Keypatch_Asm:
             mode = KS_MODE_THUMB
 
         try:
-            # If no Keystone instance is passed, create a new one
+            # If no Keystone instance is passed, create a new one or use the one passed at construction time.
             if not ks:
-                ks = Ks(arch, mode)
-                if arch == KS_ARCH_X86:
-                    ks.syntax = syntax
+                ks = self.ks
+                if not ks:
+                    # Create a new assembler
+                    ks = Ks(arch, mode)
+                    if arch == KS_ARCH_X86:
+                        ks.syntax = syntax
 
             encoding, count = ks.asm(self.fix_ida_syntax(assembly), address)
         except KsError as e:
@@ -805,15 +838,17 @@ class Keypatch_Asm:
             #print("Keypatch Error: {0}".format(e))
             #print("Original asm: {0}".format(assembly))
             #print("Fixed up asm: {0}".format(self.fix_ida_syntax(assembly)))
-            encoding, count = None, 0
+            encoding, count = None, str(e)
 
         return (encoding, count)
 
 
-    # patch at address, return the number of written bytes & original data
-    # this process can fail in some cases
     @staticmethod
     def patch_raw(address, patch_data, size):
+        """
+		Patch at address, return the number of written bytes & original data
+        This process can fail in some cases
+		"""
         ea = address
         orig_data = ''
 
@@ -1208,7 +1243,7 @@ class Keypatch_Form(idaapi.Form):
 
         return 1
 
-    # get Patcher/FillRange options
+    # Get Patcher/FillRange options
     def get_opts(self, name=None):
         names = self.c_opt_chk.children_names
         val = self.c_opt_chk.value
@@ -1597,13 +1632,13 @@ try:
             self.plugin.fill_range()
             return 1
 
-    # context menu for Undo
+    # Context menu for Undo
     class Kp_MC_Undo(Kp_Menu_Context):
         def activate(self, ctx):
             self.plugin.undo()
             return 1
 
-    # context menu for Search
+    # Context menu for Search
     class Kp_MC_Search(Kp_Menu_Context):
         def activate(self, ctx):
             self.plugin.search()
@@ -1865,7 +1900,12 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
         init_assembly = None
         while True:
-            f = Keypatch_Patcher(self.kp_asm, address, assembly=init_assembly, opts=self.opts)
+            f = Keypatch_Patcher(
+                self.kp_asm, 
+                address, 
+                assembly=init_assembly, 
+                opts=self.opts)
+
             ok = f.Execute()
             if ok == 1:
                 try:
@@ -1949,7 +1989,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
             except KsError as e:
                 print("Keypatch Error: {0}".format(e))
 
-        # free this form
+        # Free this form
         f.Free()
 
     def run(self, arg):
@@ -1957,6 +1997,6 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
 
 #########################################################################################################
-# register IDA plugin
+# Register IDA plugin
 def PLUGIN_ENTRY():
     return Keypatch_Plugin_t()
